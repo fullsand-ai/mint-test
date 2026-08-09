@@ -1,0 +1,15 @@
+name: mint-ap
+on: push
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+jobs:
+  mint:
+    uses: fullsand-ai/fullsend/.github/workflows/mint-ap-reusable.yml@main
+    with:
+      mint_url: 'https://fullsand-mint.barak-korren.workers.dev'
+      role: 'coder'
+      repos_json: '["mint-test-other"]'
+      target_org: ''
+      expected_scope_repo: ''
