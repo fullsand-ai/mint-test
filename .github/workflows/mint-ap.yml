@@ -1,0 +1,119 @@
+name: mint-ap
+on: push
+permissions:
+  id-token: write
+  contents: read
+  actions: write
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint via curl
+        id: mint
+        env:
+          MINT_URL: 'https://fullsand-mint.barak-korren.workers.dev'
+          ROLE: 'triage'
+          REPOS_JSON: '["mint-test"]'
+          EXPECTED_SCOPE_REPO: ''
+          TARGET_ORG: ''
+        run: |
+          set -euo pipefail
+          # Always exit 0 so GitHub does not email on "failed" runs; outcome lives
+          # in mint-ap-result.json for the driver.
+          finish() { exit 0; }
+          trap finish EXIT
+
+          OIDC_TOKEN=$(curl -sSf --retry 3 --retry-delay 2 --retry-all-errors \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=fullsend-mint" | jq -r '.value' || true)
+          if [[ -z "$OIDC_TOKEN" || "$OIDC_TOKEN" == "null" ]]; then
+            echo "Failed to obtain OIDC token" >&2
+            jq -n '{outcome:"denied",error:"oidc"}' > mint-ap-result.json
+            exit 0
+          fi
+          echo "::add-mask::$OIDC_TOKEN"
+
+          if [[ -z "${REPOS_JSON}" ]]; then
+            if [[ -n "${TARGET_ORG}" ]]; then
+              BODY=$(jq -nc --arg role "$ROLE" --arg target_org "$TARGET_ORG" \
+                '{role: $role, target_org: $target_org}')
+            else
+              BODY=$(jq -nc --arg role "$ROLE" '{role: $role}')
+            fi
+          else
+            if [[ -n "${TARGET_ORG}" ]]; then
+              BODY=$(jq -nc --arg role "$ROLE" --argjson repos "$REPOS_JSON" --arg target_org "$TARGET_ORG" \
+                '{role: $role, repos: $repos, target_org: $target_org}')
+            else
+              BODY=$(jq -nc --arg role "$ROLE" --argjson repos "$REPOS_JSON" \
+                '{role: $role, repos: $repos}')
+            fi
+          fi
+
+          HTTP_CODE=$(curl -sS --retry 2 --retry-delay 2 \
+            -o mint-ap-response.json -w '%{http_code}' \
+            -H "Authorization: Bearer $OIDC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$BODY" \
+            "${MINT_URL}/v1/token" || true)
+
+          if [[ ! "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
+            echo "Mint denied/failed HTTP $HTTP_CODE"
+            jq -n --arg code "$HTTP_CODE" '{outcome:"denied",http_status:($code|tonumber)}' \
+              > mint-ap-result.json
+            exit 0
+          fi
+
+          TOKEN=$(jq -r '.token // empty' mint-ap-response.json)
+          if [[ -z "$TOKEN" || "$TOKEN" == "null" ]]; then
+            echo "Mint response missing token" >&2
+            jq -n '{outcome:"denied",error:"no_token"}' > mint-ap-result.json
+            exit 0
+          fi
+          echo "::add-mask::$TOKEN"
+
+          SELECTION=$(jq -r '.repository_selection // empty' mint-ap-response.json)
+          REPOS=$(jq -c '.granted_repos // []' mint-ap-response.json)
+          PERMS=$(jq -c '.granted_permissions // {}' mint-ap-response.json)
+
+          jq -n \
+            --arg outcome minted \
+            --arg selection "$SELECTION" \
+            --argjson repos "$REPOS" \
+            --argjson perms "$PERMS" \
+            '{outcome:$outcome, repository_selection:$selection, granted_repos:$repos, granted_permissions:$perms}' \
+            > mint-ap-result.json
+
+          echo "MINT_AP_RESULT=$(cat mint-ap-result.json)"
+
+          if [[ -n "$EXPECTED_SCOPE_REPO" ]]; then
+            if [[ "$SELECTION" != "selected" ]]; then
+              echo "Expected repository_selection=selected, got '${SELECTION}'" >&2
+              jq -n \
+                --arg selection "$SELECTION" \
+                --argjson repos "$REPOS" \
+                --argjson perms "$PERMS" \
+                '{outcome:"denied",error:"scope",repository_selection:$selection,granted_repos:$repos,granted_permissions:$perms}' \
+                > mint-ap-result.json
+              exit 0
+            fi
+            if ! jq -e --arg want "$EXPECTED_SCOPE_REPO" \
+              '.granted_repos | index($want) != null' mint-ap-result.json >/dev/null; then
+              echo "Expected granted_repos to contain $EXPECTED_SCOPE_REPO, got $REPOS" >&2
+              jq -n \
+                --arg selection "$SELECTION" \
+                --argjson repos "$REPOS" \
+                --argjson perms "$PERMS" \
+                '{outcome:"denied",error:"scope",repository_selection:$selection,granted_repos:$repos,granted_permissions:$perms}' \
+                > mint-ap-result.json
+              exit 0
+            fi
+          fi
+
+      - name: Upload mint-ap result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mint-ap-result
+          path: mint-ap-result.json
+          if-no-files-found: ignore
